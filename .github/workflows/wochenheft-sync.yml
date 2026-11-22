@@ -1,0 +1,51 @@
+name: Tremelitos Wochenheft synchronisieren
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 19 * * 6'
+permissions:
+  contents: write
+concurrency:
+  group: tremelitos-publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Aktuelle Ausgabe aus privatem Quellrepository laden
+        env:
+          SOURCE_TOKEN: ${{ secrets.TREMELITOS_SOURCE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SOURCE_TOKEN" ]; then
+            echo "::error::Repository-Secret TREMELITOS_SOURCE_TOKEN fehlt"
+            exit 1
+          fi
+          curl --fail --silent --show-error --location --retry 2 \
+            --header "Authorization: Bearer $SOURCE_TOKEN" \
+            --header "Accept: application/vnd.github.raw+json" \
+            "https://api.github.com/repos/Scout901/Tremelitos-Angebote/contents/index.html?ref=main" \
+            --output /tmp/tremelitos-index.html
+      - name: Sicherheitspruefung vor Veroeffentlichung
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re, sys
+          html = Path('/tmp/tremelitos-index.html').read_text(encoding='utf-8')
+          cards = len(re.findall(r'<article\s+class="tile"', html))
+          logos = len(re.findall(r'class="(?:aldi-market-logo|market-logo)"', html))
+          if cards < 50 or logos < 24 or 'data-period="week"' not in html or 'data-period="thu"' not in html or 'data-period="fri"' not in html:
+              sys.exit(f'Abbruch: unvollstaendige Ausgabe ({cards} Karten, {logos} Logos)')
+          print(f'Geprueft: {cards} Karten, {logos} Logos')
+          PY
+      - name: Nur gepruefte Ausgabe bereitstellen
+        run: |
+          cp /tmp/tremelitos-index.html index.html
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto: Tremelitos Wochenheft aktualisieren"
+            git push
+          fi
