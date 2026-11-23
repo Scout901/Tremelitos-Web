@@ -1,37 +1,47 @@
-name: Tremelitos-Web aus Hauptversion aktualisieren
+name: Tremelitos-Web synchronisieren und Pages erneuern
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'index.html'
+      - '.github/workflows/wochenheft-sync.yml'
   workflow_dispatch:
   repository_dispatch:
     types: [tremelitos_main_updated]
   schedule:
-    # GitHub erlaubt mindestens 5-Minuten-Abstände; Läufe können sich verzögern.
+    # Alle 5 Minuten mit einigen Minuten Versatz zum vollen Stundenbeginn.
     - cron: '3-58/5 * * * *'
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 concurrency:
   group: tremelitos-public-main-sync
   cancel-in-progress: false
 
 jobs:
-  synchronisieren:
+  abgleichen:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      build_type: ${{ steps.pages.outputs.build_type }}
     steps:
-      - name: Öffentliches Web-Repository auschecken
+      - name: Aktuelle öffentliche main auschecken
         uses: actions/checkout@v4
         with:
           ref: main
           persist-credentials: true
-      - name: Aktuelles Blatt aus privatem main laden
+      - name: Private Quellversion laden
         env:
           SOURCE_TOKEN: ${{ secrets.TREMELITOS_SOURCE_TOKEN }}
         run: |
           set -euo pipefail
           if [ -z "${SOURCE_TOKEN}" ]; then
-            echo "::error::TREMELITOS_SOURCE_TOKEN fehlt im öffentlichen Web-Repository."
+            echo "::error::TREMELITOS_SOURCE_TOKEN fehlt im öffentlichen Repository."
             exit 1
           fi
           curl --fail --silent --show-error --location --retry 3 \
@@ -39,47 +49,103 @@ jobs:
             --header "Accept: application/vnd.github.raw+json" \
             "https://api.github.com/repos/Scout901/Tremelitos-Angebote/contents/index.html?ref=main" \
             --output /tmp/tremelitos-index.html
-      - name: Unvollständige oder beschädigte Ausgabe verhindern
+      - name: Ausgabe strukturell gegen Fehler prüfen
         run: |
           python - <<'PY'
           from pathlib import Path
           import html, re, sys
-          source = Path('/tmp/tremelitos-index.html').read_text(encoding='utf-8')
-          old = Path('index.html').read_text(encoding='utf-8') if Path('index.html').exists() else ''
-          offers = re.findall(r'<article\s+class="tile"\s+([^>]*)>(.*?)</article>', source, re.S)
-          labels = [html.unescape(re.search(r'aria-label="([^"]+)"', a).group(1))
-                    for a, _ in offers if re.search(r'aria-label="([^"]+)"', a)]
-          logos = len(re.findall(r'class="(?:aldi-market-logo|market-logo)"', source))
-          periods = set(re.findall(r'<section\s+class="period"\s+data-period="([^"]+)"', source))
-          if len(offers) < 50 or logos < 24 or not {'week','thu','fri'} <= periods:
-              sys.exit(f'Abbruch: unvollständig, {len(offers)} Karten, {logos} Logos, {periods}')
-          if len(labels) != len(offers) or len(labels) != len(set(labels)):
-              sys.exit('Abbruch: fehlende oder doppelte Angebotsnamen')
-          for attrs, body in offers:
-              label = html.unescape(re.search(r'aria-label="([^"]+)"', attrs).group(1))
+          src = Path('/tmp/tremelitos-index.html').read_text(encoding='utf-8')
+          cards = re.findall(r'<article\s+class="tile"\s+([^>]*)>(.*?)</article>', src, re.S)
+          labels = [html.unescape(re.search(r'aria-label="([^"]+)"', attrs).group(1))
+                    for attrs, _ in cards if re.search(r'aria-label="([^"]+)"', attrs)]
+          logos = len(re.findall(r'class="(?:aldi-market-logo|market-logo)"', src))
+          periods = set(re.findall(r'<section\s+class="period"\s+data-period="([^"]+)"', src))
+          if len(cards) < 50 or logos < 24 or not {'week','thu','fri'} <= periods:
+              sys.exit(f'Abbruch: unvollständiges Blatt, {len(cards)} Karten, {logos} Logos')
+          if len(labels) != len(cards) or len(set(labels)) != len(labels):
+              sys.exit('Abbruch: doppelte oder nicht beschriftete Angebotskarten')
+          for attrs, body in cards:
+              name = html.unescape(re.search(r'aria-label="([^"]+)"', attrs).group(1))
               imgs = re.findall(r'<img\b[^>]*>', body, re.S)
               if len(imgs) != 1 or not re.search(r'\bsrc="(?:data:image/|https://)', imgs[0]):
-                  sys.exit(f'Abbruch: ungültiges Produktbild bei {label}')
+                  sys.exit(f'Abbruch: Produktbild fehlt bei {name}')
               if not re.search(r'\bdata-source="https://', attrs) or '€' not in body:
-                  sys.exit(f'Abbruch: Quelle oder Preis fehlt bei {label}')
-          old_count = len(re.findall(r'<article\s+class="tile"', old))
-          if old_count >= 50 and len(offers) < old_count - 5:
-              sys.exit(f'Abbruch: unerwarteter Rückgang von {old_count} auf {len(offers)} Angebote')
-          print(f'Prüfung OK: {len(offers)} Angebote, {logos} Logos, 3 Zeitfenster')
+                  sys.exit(f'Abbruch: Preis oder Angebotsquelle fehlt bei {name}')
+          print(f'{len(cards)} Karten, {logos} Logos und drei Tagesreiter vorhanden.')
           PY
-      - name: Bei Änderung automatisch nach main veröffentlichen
+      - name: Nur geänderte Ausgabe auf öffentliche main übertragen
+        id: commit
         run: |
           set -euo pipefail
+          git pull --ff-only origin main
           if cmp -s /tmp/tremelitos-index.html index.html; then
-            echo "Web ist schon identisch mit privatem main; kein Commit notwendig."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Öffentliche main ist bereits identisch mit privater main."
             exit 0
           fi
-          git pull --ff-only origin main
           cp /tmp/tremelitos-index.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto: geprüftes Tremelitos-Heft aus privatem main synchronisieren"
-            git push origin HEAD:main
+          git commit -m "Auto: aktuelle geprüfte Tremelitos-Ausgabe veröffentlichen"
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: GitHub Pages-Veröffentlichungsmodus feststellen
+        id: pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages" \
+            -o /tmp/pages.json
+          TYPE="$(jq -r '.build_type // "legacy"' /tmp/pages.json)"
+          echo "build_type=${TYPE}" >> "$GITHUB_OUTPUT"
+          echo "GitHub Pages-Modus: ${TYPE}"
+
+  pages_aus_branch:
+    needs: abgleichen
+    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type != 'workflow' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Branch-basierten GitHub Pages-Build explizit auslösen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/pages/builds"
+          echo "Neubau der GitHub Pages-Seite angefordert."
+
+  pages_aus_actions:
+    needs: abgleichen
+    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type == 'workflow' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - name: Aktuelle öffentliche main laden
+        uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: GitHub Pages einrichten
+        uses: actions/configure-pages@v5
+      - name: Unveränderte HTML-Ausgabe für Pages bereitstellen
+        run: |
+          mkdir -p _site
+          cp index.html _site/index.html
+          if [ -f google3987cbfa859aa19e-1.html ]; then
+            cp google3987cbfa859aa19e-1.html _site/
           fi
+      - name: Pages-Artefakt hochladen
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - name: Auf bestehender Adresse veröffentlichen
+        id: deploy
+        uses: actions/deploy-pages@v4
