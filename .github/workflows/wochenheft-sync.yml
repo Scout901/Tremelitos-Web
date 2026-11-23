@@ -1,51 +1,85 @@
-name: Tremelitos Wochenheft synchronisieren
+name: Tremelitos-Web aus Hauptversion aktualisieren
+
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types: [tremelitos_main_updated]
   schedule:
-    - cron: '30 19 * * 6'
+    # GitHub erlaubt mindestens 5-Minuten-Abstände; Läufe können sich verzögern.
+    - cron: '3-58/5 * * * *'
+
 permissions:
   contents: write
+
 concurrency:
-  group: tremelitos-publish
+  group: tremelitos-public-main-sync
   cancel-in-progress: false
+
 jobs:
-  publish:
+  synchronisieren:
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-      - name: Aktuelle Ausgabe aus privatem Quellrepository laden
+      - name: Öffentliches Web-Repository auschecken
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+      - name: Aktuelles Blatt aus privatem main laden
         env:
           SOURCE_TOKEN: ${{ secrets.TREMELITOS_SOURCE_TOKEN }}
         run: |
           set -euo pipefail
-          if [ -z "$SOURCE_TOKEN" ]; then
-            echo "::error::Repository-Secret TREMELITOS_SOURCE_TOKEN fehlt"
+          if [ -z "${SOURCE_TOKEN}" ]; then
+            echo "::error::TREMELITOS_SOURCE_TOKEN fehlt im öffentlichen Web-Repository."
             exit 1
           fi
-          curl --fail --silent --show-error --location --retry 2 \
-            --header "Authorization: Bearer $SOURCE_TOKEN" \
+          curl --fail --silent --show-error --location --retry 3 \
+            --header "Authorization: Bearer ${SOURCE_TOKEN}" \
             --header "Accept: application/vnd.github.raw+json" \
             "https://api.github.com/repos/Scout901/Tremelitos-Angebote/contents/index.html?ref=main" \
             --output /tmp/tremelitos-index.html
-      - name: Sicherheitspruefung vor Veroeffentlichung
+      - name: Unvollständige oder beschädigte Ausgabe verhindern
         run: |
           python - <<'PY'
           from pathlib import Path
-          import re, sys
-          html = Path('/tmp/tremelitos-index.html').read_text(encoding='utf-8')
-          cards = len(re.findall(r'<article\s+class="tile"', html))
-          logos = len(re.findall(r'class="(?:aldi-market-logo|market-logo)"', html))
-          if cards < 50 or logos < 24 or 'data-period="week"' not in html or 'data-period="thu"' not in html or 'data-period="fri"' not in html:
-              sys.exit(f'Abbruch: unvollstaendige Ausgabe ({cards} Karten, {logos} Logos)')
-          print(f'Geprueft: {cards} Karten, {logos} Logos')
+          import html, re, sys
+          source = Path('/tmp/tremelitos-index.html').read_text(encoding='utf-8')
+          old = Path('index.html').read_text(encoding='utf-8') if Path('index.html').exists() else ''
+          offers = re.findall(r'<article\s+class="tile"\s+([^>]*)>(.*?)</article>', source, re.S)
+          labels = [html.unescape(re.search(r'aria-label="([^"]+)"', a).group(1))
+                    for a, _ in offers if re.search(r'aria-label="([^"]+)"', a)]
+          logos = len(re.findall(r'class="(?:aldi-market-logo|market-logo)"', source))
+          periods = set(re.findall(r'<section\s+class="period"\s+data-period="([^"]+)"', source))
+          if len(offers) < 50 or logos < 24 or not {'week','thu','fri'} <= periods:
+              sys.exit(f'Abbruch: unvollständig, {len(offers)} Karten, {logos} Logos, {periods}')
+          if len(labels) != len(offers) or len(labels) != len(set(labels)):
+              sys.exit('Abbruch: fehlende oder doppelte Angebotsnamen')
+          for attrs, body in offers:
+              label = html.unescape(re.search(r'aria-label="([^"]+)"', attrs).group(1))
+              imgs = re.findall(r'<img\b[^>]*>', body, re.S)
+              if len(imgs) != 1 or not re.search(r'\bsrc="(?:data:image/|https://)', imgs[0]):
+                  sys.exit(f'Abbruch: ungültiges Produktbild bei {label}')
+              if not re.search(r'\bdata-source="https://', attrs) or '€' not in body:
+                  sys.exit(f'Abbruch: Quelle oder Preis fehlt bei {label}')
+          old_count = len(re.findall(r'<article\s+class="tile"', old))
+          if old_count >= 50 and len(offers) < old_count - 5:
+              sys.exit(f'Abbruch: unerwarteter Rückgang von {old_count} auf {len(offers)} Angebote')
+          print(f'Prüfung OK: {len(offers)} Angebote, {logos} Logos, 3 Zeitfenster')
           PY
-      - name: Nur gepruefte Ausgabe bereitstellen
+      - name: Bei Änderung automatisch nach main veröffentlichen
         run: |
+          set -euo pipefail
+          if cmp -s /tmp/tremelitos-index.html index.html; then
+            echo "Web ist schon identisch mit privatem main; kein Commit notwendig."
+            exit 0
+          fi
+          git pull --ff-only origin main
           cp /tmp/tremelitos-index.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add index.html
           if ! git diff --cached --quiet; then
-            git commit -m "Auto: Tremelitos Wochenheft aktualisieren"
-            git push
+            git commit -m "Auto: geprüftes Tremelitos-Heft aus privatem main synchronisieren"
+            git push origin HEAD:main
           fi
