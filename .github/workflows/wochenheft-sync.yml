@@ -107,7 +107,7 @@ jobs:
 
   pages_aus_branch:
     needs: abgleichen
-    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type != 'workflow' }}
+    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type != 'workflow' && (needs.abgleichen.outputs.changed == 'true' || github.event_name != 'schedule') }}
     runs-on: ubuntu-latest
     steps:
       - name: Branch-basierten GitHub Pages-Build explizit auslösen
@@ -123,7 +123,7 @@ jobs:
 
   pages_aus_actions:
     needs: abgleichen
-    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type == 'workflow' }}
+    if: ${{ needs.abgleichen.result == 'success' && needs.abgleichen.outputs.build_type == 'workflow' && (needs.abgleichen.outputs.changed == 'true' || github.event_name != 'schedule') }}
     runs-on: ubuntu-latest
     environment:
       name: github-pages
